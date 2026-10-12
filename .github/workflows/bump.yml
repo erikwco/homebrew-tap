@@ -1,0 +1,326 @@
+name: Bump formula
+
+# Publishes Formula/projectory.rb for an already published, immutable Projectory
+# release. The workflow validates the release, downloads and verifies the four
+# prebuilt archives, tests the generated formula in an isolated tap on every
+# platform and then opens (or reuses) a pull request with that evidence.
+#
+# Inputs never reach a shell through ${{ }}: they are passed as environment
+# variables and the version is validated before any other step uses it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Projectory version without v (1.2.3; 1.2.3-rc.1 only with dry run)
+        required: true
+        type: string
+      dry_run:
+        description: Validate and test only; do not open a pull request
+        required: true
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: bump-formula-${{ inputs.dry_run && 'dry-run' || 'publish' }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: erikwco/projectory
+  GITHUB_API_VERSION: "2026-03-10"
+  CI_FORMULA: projectory-ci/test/projectory
+
+jobs:
+  prepare:
+    name: Validate release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.input.outputs.version }}
+    env:
+      VERSION: ${{ inputs.version }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Test the formula generator
+        run: python3 -I -m unittest discover -s tests -v
+
+      - name: Validate inputs
+        id: input
+        run: |
+          case "$DRY_RUN" in
+            true) prerelease=(--allow-prerelease) ;;
+            false) prerelease=() ;;
+            *) echo "::error::dry_run must be true or false"; exit 1 ;;
+          esac
+          if [ "$DRY_RUN" = false ] && [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::Publishing must run from main; use dry_run=true to test another branch"
+            exit 1
+          fi
+          python3 -I scripts/projectory_formula.py check-version --version "$VERSION" "${prerelease[@]}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Read release metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: $GITHUB_API_VERSION" \
+            "repos/$UPSTREAM/releases/tags/v$VERSION" > "$RUNNER_TEMP/release.json"
+          flags=()
+          if [ "$DRY_RUN" = true ]; then flags=(--allow-prerelease); else flags=(--require-immutable); fi
+          python3 -I scripts/projectory_formula.py check-release --version "$VERSION" \
+            --release-json "$RUNNER_TEMP/release.json" "${flags[@]}"
+
+      - name: Download release assets
+        run: |
+          mkdir -p "$RUNNER_TEMP/assets"
+          python3 -I scripts/projectory_formula.py assets --version "$VERSION" --allow-prerelease > "$RUNNER_TEMP/assets.tsv"
+          while IFS=$'\t' read -r name url; do
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+              --max-filesize 104857600 --max-time 300 --retry 3 \
+              --output "$RUNNER_TEMP/assets/$name" "$url"
+          done < "$RUNNER_TEMP/assets.tsv"
+
+      - name: Verify checksums, API digests and archive contents
+        run: |
+          python3 -I scripts/projectory_formula.py verify-assets --version "$VERSION" --allow-prerelease \
+            --dir "$RUNNER_TEMP/assets" --release-json "$RUNNER_TEMP/release.json" | tee "$RUNNER_TEMP/verified.txt"
+
+      - name: Verify release attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(jq -r '.immutable' "$RUNNER_TEMP/release.json")" != true ]; then
+            echo "::warning::v$VERSION is not an immutable release; attestation check skipped (dry run only)"
+            echo "not immutable (dry run): attestation skipped" > "$RUNNER_TEMP/attestation.txt"
+            exit 0
+          fi
+          gh release verify-asset --help > /dev/null
+          gh release verify "v$VERSION" -R "$UPSTREAM"
+          cut -f1 "$RUNNER_TEMP/assets.tsv" | while read -r name; do
+            gh release verify-asset "v$VERSION" "$RUNNER_TEMP/assets/$name" -R "$UPSTREAM"
+          done
+          echo "immutable release; gh release verify-asset passed for all five assets" > "$RUNNER_TEMP/attestation.txt"
+
+      - name: Generate formula
+        run: |
+          mkdir -p "$RUNNER_TEMP/formula"
+          python3 -I scripts/projectory_formula.py generate --version "$VERSION" --allow-prerelease \
+            --checksums "$RUNNER_TEMP/assets/checksums.txt" --output "$RUNNER_TEMP/formula/projectory.rb"
+          if status="$(python3 -I scripts/projectory_formula.py compare --version "$VERSION" --allow-prerelease \
+              --existing Formula/projectory.rb --generated "$RUNNER_TEMP/formula/projectory.rb")"; then
+            echo "Tap status: $status"
+          elif [ "$DRY_RUN" = true ]; then
+            echo "::warning::publishing $VERSION would be refused (see error above)"
+          else
+            exit 1
+          fi
+          {
+            echo "### Release"
+            echo
+            echo "- Release: https://github.com/$UPSTREAM/releases/tag/v$VERSION"
+            echo "- State: published, $(jq -r 'if .prerelease then "prerelease" else "stable" end' "$RUNNER_TEMP/release.json"), immutable=$(jq -r '.immutable' "$RUNNER_TEMP/release.json")"
+            echo "- Attestation: $(cat "$RUNNER_TEMP/attestation.txt")"
+            echo "- Archives verified against checksums.txt, GitHub asset digests and the archive member contract:"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/verified.txt"
+            echo '```'
+          } > "$RUNNER_TEMP/formula/release.md"
+          cat "$RUNNER_TEMP/formula/release.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: formula
+          path: ${{ runner.temp }}/formula/
+          if-no-files-found: error
+          retention-days: 14
+
+  test:
+    name: Test (${{ matrix.runner }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.optional }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            optional: false
+          - runner: ubuntu-latest
+            optional: false
+          - runner: ubuntu-24.04-arm
+            optional: false
+          - runner: macos-26-intel
+            optional: true
+    steps:
+      - uses: Homebrew/actions/setup-homebrew@eb02c69dbabdb66ff183c614f4ce7ab3c077592c # 2026.10.12.1
+        with:
+          # Test with the released Homebrew users run, not Homebrew/brew main (the default inside tap repositories).
+          stable: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: formula
+          path: ${{ runner.temp }}/formula
+
+      - name: Create an isolated CI tap
+        run: |
+          brew tap-new --no-git projectory-ci/test
+          cp "$RUNNER_TEMP/formula/projectory.rb" "$(brew --repository projectory-ci/test)/Formula/projectory.rb"
+          brew trust --formula "$CI_FORMULA"
+
+      - run: brew style "$CI_FORMULA"
+      - run: brew audit --strict --online --formula "$CI_FORMULA"
+      - run: brew install --formula --verbose "$CI_FORMULA"
+      - run: brew test --verbose "$CI_FORMULA"
+
+      - name: Record evidence
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          printf -- "- \`%s\` (%s): brew style, audit --strict --online, install and test passed; %s; %s\n" \
+            "$RUNNER_LABEL" "$(uname -sm)" "$(brew --version | head -n 1)" \
+            "$("$(brew --prefix)/opt/projectory/bin/projectory" --version)" > "$RUNNER_TEMP/evidence/$RUNNER_LABEL.md"
+          brew uninstall --formula "$CI_FORMULA"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: evidence-${{ matrix.runner }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Open pull request
+    needs: [prepare, test]
+    if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/artifacts
+
+      - name: Check the tap and open bump pull requests
+        id: state
+        run: |
+          # Strict re-validation: this job must never publish a release candidate.
+          python3 -I scripts/projectory_formula.py check-version --version "$VERSION"
+          generated="$RUNNER_TEMP/artifacts/formula/projectory.rb"
+          status="$(python3 -I scripts/projectory_formula.py compare --version "$VERSION" \
+            --existing Formula/projectory.rb --generated "$generated")"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "Tap status: $status"
+          # Refuse to open a bump that an already open, newer bump would rewind.
+          gh pr list --repo "$GITHUB_REPOSITORY" --base main --state open --limit 100 \
+            --json number,headRefName --jq '.[] | select(.headRefName | startswith("bump/projectory-")) | "\(.number)\t\(.headRefName)"' \
+            > "$RUNNER_TEMP/open-bumps.tsv"
+          : > "$RUNNER_TEMP/superseded.txt"
+          while IFS=$'\t' read -r number branch; do
+            other="${branch#bump/projectory-}"
+            [ "$other" = "$VERSION" ] && continue
+            if ! python3 -I scripts/projectory_formula.py check-version --version "$other" > /dev/null 2>&1; then
+              echo "::warning::ignoring pull request #$number with unexpected branch name"
+              continue
+            fi
+            newest="$(printf '%s\n%s\n' "$other" "$VERSION" | sort -V | tail -n 1)"
+            if [ "$newest" = "$other" ]; then
+              echo "::error::pull request #$number already bumps to newer version $other"
+              exit 1
+            fi
+            echo "$number" >> "$RUNNER_TEMP/superseded.txt"
+          done < "$RUNNER_TEMP/open-bumps.tsv"
+
+      - name: Create or reuse the bump branch
+        if: steps.state.outputs.status != 'unchanged'
+        run: |
+          branch="bump/projectory-$VERSION"
+          generated="$RUNNER_TEMP/artifacts/formula/projectory.rb"
+          base="$(git rev-parse HEAD)"
+          if head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" --jq .object.sha 2> "$RUNNER_TEMP/ref.err")"; then
+            if [ "$head" != "$base" ]; then
+              gh api -H "Accept: application/vnd.github.raw" \
+                "repos/$GITHUB_REPOSITORY/contents/Formula/projectory.rb?ref=$branch" > "$RUNNER_TEMP/branch.rb"
+              if ! cmp -s "$RUNNER_TEMP/branch.rb" "$generated"; then
+                echo "::error::$branch exists with different content; review and delete it before retrying"
+                exit 1
+              fi
+              echo "Reusing $branch"
+              exit 0
+            fi
+            # A previous run may have created the branch but failed before the
+            # contents commit. Its unchanged main tip is safe to complete.
+            echo "Completing $branch from $base"
+          elif grep -q 'HTTP 404' "$RUNNER_TEMP/ref.err"; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/heads/$branch" -f "sha=$base" > /dev/null
+          else
+            cat "$RUNNER_TEMP/ref.err" >&2
+            exit 1
+          fi
+          # The contents API commits through GitHub, so the commit is signed and no git credentials are needed.
+          args=(-f "branch=$branch" -f "message=projectory $VERSION" -f "content=$(base64 -w 0 "$generated")")
+          if existing="$(git rev-parse --verify --quiet "HEAD:Formula/projectory.rb")"; then
+            args+=(-f "sha=$existing")
+          fi
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/Formula/projectory.rb" "${args[@]}" > /dev/null
+          echo "Committed formula on $branch"
+
+      - name: Open or reuse the pull request
+        if: steps.state.outputs.status != 'unchanged'
+        run: |
+          branch="bump/projectory-$VERSION"
+          {
+            echo "Updates \`erikwco/tap/projectory\` to [v$VERSION](https://github.com/$UPSTREAM/releases/tag/v$VERSION)."
+            echo
+            echo "Generated and tested by [this workflow run]($RUN_URL). Pull requests opened with \`GITHUB_TOKEN\` do not trigger"
+            echo "\`pull_request\` workflows, so the evidence below is the test record for this change."
+            echo
+            cat "$RUNNER_TEMP/artifacts/formula/release.md"
+            echo
+            echo "### Formula tests in an isolated tap"
+            echo
+            for runner in macos-latest ubuntu-latest ubuntu-24.04-arm macos-26-intel; do
+              file="$RUNNER_TEMP/artifacts/evidence-$runner/$runner.md"
+              if [ -f "$file" ]; then cat "$file"; else echo "- \`$runner\`: no evidence (optional runner failed or was unavailable)"; fi
+            done
+          } > "$RUNNER_TEMP/pr-body.md"
+          number="$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --head "$branch" --state open --json number --jq '.[0].number // empty')"
+          if [ -z "$number" ]; then
+            url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
+              --title "projectory $VERSION" --body-file "$RUNNER_TEMP/pr-body.md")"
+            number="${url##*/}"
+          else
+            gh pr edit "$number" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/pr-body.md"
+          fi
+          while read -r old; do
+            gh pr close "$old" --repo "$GITHUB_REPOSITORY" --delete-branch --comment "Superseded by #$number (projectory $VERSION)."
+          done < "$RUNNER_TEMP/superseded.txt"
+          echo "Pull request: https://github.com/$GITHUB_REPOSITORY/pull/$number" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Nothing to publish
+        if: steps.state.outputs.status == 'unchanged'
+        run: echo "Formula/projectory.rb on main already ships $VERSION with identical content." >> "$GITHUB_STEP_SUMMARY"
